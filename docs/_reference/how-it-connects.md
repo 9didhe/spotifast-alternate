@@ -301,3 +301,11 @@ On startup, network work waits for the protected proxy password to be restored.
 That lookup runs on the credential worker and does not block the interface or
 shutdown. The password belongs to its host, port, and username; editing any of
 these fields clears it. See [password storage and migration](/settings-and-files/).
+
+## Listening history
+
+The playback session reports completed and interrupted listens through librespot.
+Reports use the audio delivered to the output, excluding paused time and seek
+jumps. Closing Spotifast waits up to ten seconds for pending reports. Network
+failures are logged; reports are not persisted for a later launch. This does not
+require the optional personal Web API app, which is used to read recent history.
