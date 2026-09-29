@@ -1344,6 +1344,7 @@ struct Worker {
     /// other request reports.
     rootlist_pending: bool,
     album_type_lookup: AlbumTypeLookup,
+    engine_shutdowns: tokio::task::JoinSet<()>,
     /// Saved shows waiting for the streaming session to say which are audiobooks.
     audiobook_lookup: BTreeSet<String>,
     /// Radios asked for before the streaming session was ready, by seed.
@@ -1411,6 +1412,7 @@ impl Worker {
             heard: None,
             rootlist_pending: false,
             album_type_lookup: AlbumTypeLookup::default(),
+            engine_shutdowns: tokio::task::JoinSet::new(),
             audiobook_lookup: BTreeSet::new(),
             radio_waiting: BTreeMap::new(),
             engine_busy: false,
@@ -1811,7 +1813,7 @@ impl Worker {
                     if lease.current() && self.signed_in {
                         self.on_engine_connected(session_generation, *engine, error)
                     } else if let Some(engine) = *engine {
-                        engine.shutdown();
+                        self.retire_engine(engine);
                     }
                 }
                 Command::SignInEnded { source, attempt } => {
@@ -2023,10 +2025,23 @@ impl Worker {
             }
         }
         if let Some(engine) = self.engine.take() {
-            engine.shutdown();
+            self.retire_engine(engine);
         }
         drop(cache_writes);
         let _ = cache_writer.await;
+        while let Some(result) = self.engine_shutdowns.join_next().await {
+            if let Err(error) = result {
+                log::warn!("player shutdown failed: {error}");
+            }
+        }
+    }
+
+    fn retire_engine(&mut self, engine: impl Into<Arc<Engine>>) {
+        let engine = engine.into();
+        while self.engine_shutdowns.try_join_next().is_some() {}
+        self.engine_shutdowns.spawn(async move {
+            engine.shutdown_and_wait().await;
+        });
     }
 
     // ---- Web API sign-in --------------------------------------------------
@@ -2470,7 +2485,7 @@ impl Worker {
         self.radio_waiting.clear();
         self.carry_volume();
         if let Some(engine) = self.engine.take() {
-            engine.shutdown();
+            self.retire_engine(engine);
         }
         if let Some(cancel) = self.cancel_signin.take() {
             let _ = cancel.send(true);
@@ -2605,7 +2620,7 @@ impl Worker {
         self.carry_volume();
         if let Some(engine) = self.engine.take() {
             self.resume = engine.resume_point();
-            engine.shutdown();
+            self.retire_engine(engine);
         }
     }
 
@@ -2769,14 +2784,14 @@ impl Worker {
     ) {
         if !self.signed_in || session_generation != self.album_type_lookup.session_generation {
             if let Some(engine) = engine {
-                engine.shutdown();
+                self.retire_engine(engine);
             }
             return;
         }
         self.engine_busy = false;
         if std::mem::take(&mut self.engine_restart_pending) {
             if let Some(engine) = engine {
-                engine.shutdown();
+                self.retire_engine(engine);
             }
             // Keep `resume`: it belongs to the engine which was replaced,
             // not to this stale attempt. The newest config is already stored.
@@ -2787,7 +2802,7 @@ impl Worker {
             Some(engine) => {
                 if let Some(grant) = engine.credentials() {
                     if !playback_account_matches(&grant, self.api.account()) {
-                        engine.shutdown();
+                        self.retire_engine(engine);
                         self.emit(Event::Playback(LocalPlayback::Failed("Playback was authorized for another Spotify account. Enable playback again with the signed-in account.".into())));
                         return;
                     }
@@ -2836,7 +2851,7 @@ impl Worker {
             self.album_type_lookup.clear_engine_work();
             self.carry_volume();
             if let Some(engine) = self.engine.take() {
-                engine.shutdown();
+                self.retire_engine(engine);
             }
             let credential_stored = self.playback_grant.is_some();
             if credential_stored {
@@ -5614,6 +5629,29 @@ mod authorization_tests {
             assert!(matches!(runtime.block_on(lease.load()).unwrap().grant,
                 Some(StoredGrant::Web(saved)) if saved.refresh_token == "dummy-refresh"));
         }
+    }
+
+    #[test]
+    fn quitting_waits_for_a_retired_engine_without_a_current_engine() {
+        let (runtime, mut worker, _) = worker("retired-engine-shutdown");
+        runtime.block_on(async {
+            let (release, released) = tokio::sync::oneshot::channel();
+            worker.engine_shutdowns.spawn(async move {
+                released.await.unwrap();
+            });
+            assert!(worker.engine.is_none());
+            let (commands, receiver) = mpsc::unbounded_channel();
+            commands.send(Command::Shutdown).unwrap();
+            let shutdown = worker.run(receiver);
+            tokio::pin!(shutdown);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            shutdown.await;
+        });
     }
 
     #[test]

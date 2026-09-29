@@ -35,6 +35,8 @@ AUR and Homebrew packages now use the Spotifast name. See [rename compatibility]
   device. Select it from your phone or play music in the app. Playback is
   gapless and supports up to 320 kbps, with
   optional volume normalisation and an on-disk audio cache.
+  Librespot reports rendered listening time to Spotify; the local
+  `history.json` play history stays on this device.
   Stalled Spotify connections time out after five seconds per attempt so
   playback can try another endpoint.
   Since 0.8.0, a confirmed local seek discards audio queued from
