@@ -19,6 +19,7 @@ use fastframe_audio::{Buffer, BufferSize, Maintained, OutputOptions, Render};
 use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
+use librespot_playback::listening::{RenderedAudio, RenderedChunk};
 use librespot_playback::mixer::VolumeGetter;
 use librespot_playback::player::PlayerEvent;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
@@ -300,6 +301,7 @@ struct TransitionSource {
     remaining: u32,
     channel: usize,
     gain: f32,
+    rendered: Option<RenderedChunk>,
 }
 
 impl TransitionSource {
@@ -318,6 +320,7 @@ impl TransitionSource {
             remaining: frames,
             channel: 0,
             gain: 1.0,
+            rendered: None,
         }
     }
 }
@@ -346,6 +349,11 @@ impl Iterator for TransitionSource {
             self.queued.consumed.fetch_add(1, Ordering::Relaxed);
         }
         self.channel = (self.channel + 1) % NUM_CHANNELS as usize;
+        if self.channel == 0
+            && let Some(rendered) = &mut self.rendered
+        {
+            rendered.rendered(1);
+        }
         Some(sample * self.gain)
     }
 
@@ -385,6 +393,7 @@ pub struct RodioSink {
     buffer_ms: u32,
     control: Arc<AudioControl>,
     open: Opener,
+    rendered: Option<Arc<RenderedAudio>>,
 }
 
 struct Output {
@@ -537,6 +546,7 @@ impl RodioSink {
             buffer_ms,
             control,
             open: open_output,
+            rendered: None,
         }
     }
 
@@ -582,6 +592,11 @@ impl RodioSink {
 }
 
 impl Sink for RodioSink {
+    fn set_rendered_audio(&mut self, audio: Option<Arc<RenderedAudio>>) -> bool {
+        self.rendered = audio;
+        true
+    }
+
     /// Never fails: an output that cannot open is reported by the first
     /// `write` instead (#623).
     ///
@@ -688,13 +703,18 @@ impl Sink for RodioSink {
             .queued
             .appended
             .fetch_add(u64::from(frames), Ordering::Relaxed);
-        output.sink.append(TransitionSource::new(
+        let mut transition = TransitionSource::new(
             source,
             Arc::clone(&output.envelope),
             Arc::clone(&output.transport),
             Arc::clone(&output.queued),
             frames,
-        ));
+        );
+        transition.rendered = self
+            .rendered
+            .as_ref()
+            .map(|audio| audio.chunk(output.sample_rate));
+        output.sink.append(transition);
         output.fed = true;
         output.last_write = Some(now);
         // Let rodio drain a little; without this the whole track would be
@@ -810,6 +830,52 @@ fn open_output(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn listening_counts_rendered_frames_and_discards_the_replaced_tail() {
+        for sample_rate in [44_100, 48_000] {
+            let audio = RenderedAudio::new();
+            let frames = sample_rate / 10;
+            let queued = Queued::new();
+            queued.appended.store(u64::from(frames), Ordering::Relaxed);
+            let mut source = TransitionSource::new(
+                rodio::buffer::SamplesBuffer::new(2, sample_rate, vec![1.0; frames as usize * 2]),
+                Envelope::open(sample_rate, INTERRUPT_FADE),
+                Envelope::open(sample_rate, TRANSPORT_FADE),
+                Arc::clone(&queued),
+                frames,
+            );
+            source.rendered = Some(audio.chunk(sample_rate));
+            assert!(
+                audio.started_at().is_none(),
+                "queued audio is not listened audio"
+            );
+            for _ in 0..frames {
+                source.next().unwrap();
+            }
+            drop(source);
+            assert_eq!(audio.played(), Duration::from_millis(50));
+            assert!(audio.started_at().is_some());
+            assert_eq!(queued.frames(), 0, "discarded frames settle the queue only");
+        }
+    }
+
+    #[test]
+    fn an_unrendered_chunk_and_an_incomplete_frame_do_not_count_as_listening() {
+        let audio = RenderedAudio::new();
+        let mut source = TransitionSource::new(
+            rodio::buffer::SamplesBuffer::new(2, SAMPLE_RATE, vec![1.0; 4]),
+            Envelope::open(SAMPLE_RATE, INTERRUPT_FADE),
+            Envelope::open(SAMPLE_RATE, TRANSPORT_FADE),
+            Queued::new(),
+            2,
+        );
+        source.rendered = Some(audio.chunk(SAMPLE_RATE));
+        source.next().unwrap();
+        drop(source);
+        assert_eq!(audio.played(), Duration::ZERO);
+        assert!(audio.started_at().is_none());
+    }
 
     /// The buffer setting reaches the device on Windows only (#88), and a
     /// settings file with a wild number in it still opens a stream: the

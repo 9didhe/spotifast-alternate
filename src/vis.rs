@@ -194,6 +194,13 @@ fn full_scale(volume: f64, applied: bool) -> Option<f64> {
 }
 
 impl Sink for Tapped {
+    fn set_rendered_audio(
+        &mut self,
+        audio: Option<Arc<librespot_playback::listening::RenderedAudio>>,
+    ) -> bool {
+        self.inner.set_rendered_audio(audio)
+    }
+
     fn start(&mut self) -> SinkResult<()> {
         self.inner.start()
     }
@@ -637,6 +644,41 @@ pub const SCOPE_STEP: usize = 7;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_audio_tap_forwards_rendered_listening_accounting() {
+        struct ReportingSink(Arc<Mutex<Option<Arc<librespot_playback::listening::RenderedAudio>>>>);
+        impl Sink for ReportingSink {
+            fn set_rendered_audio(
+                &mut self,
+                audio: Option<Arc<librespot_playback::listening::RenderedAudio>>,
+            ) -> bool {
+                *self.0.lock().unwrap() = audio;
+                true
+            }
+
+            fn write(&mut self, _: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+                Ok(())
+            }
+        }
+        let forwarded = Arc::new(Mutex::new(None));
+        let mut tapped = Tapped::new(
+            Box::new(ReportingSink(Arc::clone(&forwarded))),
+            AudioTap::new(),
+            Box::new(librespot_playback::mixer::NoOpVolume),
+            false,
+            crate::eq::shared(),
+            Arc::new(std::sync::atomic::AtomicU64::new(1.0f64.to_bits())),
+        );
+        let audio = librespot_playback::listening::RenderedAudio::new();
+        assert!(tapped.set_rendered_audio(Some(Arc::clone(&audio))));
+        assert!(Arc::ptr_eq(
+            forwarded.lock().unwrap().as_ref().unwrap(),
+            &audio
+        ));
+        assert!(tapped.set_rendered_audio(None));
+        assert!(forwarded.lock().unwrap().is_none());
+    }
+
     use super::*;
 
     fn sine(hz: f32, amplitude: f32, count: usize) -> Vec<f32> {

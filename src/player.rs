@@ -303,9 +303,21 @@ pub enum EngineEvent {
 
 pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
+fn notify_until_shutdown(
+    notify: Notify,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+) -> Notify {
+    Arc::new(move |event| {
+        if !shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            notify(event);
+        }
+    })
+}
+
 pub struct Engine {
     player: Arc<Player>,
     spirc: Arc<Spirc>,
+    spirc_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     session: Session,
     mixer: Arc<dyn Mixer>,
     device_id: String,
@@ -328,6 +340,10 @@ impl Engine {
         cache: Cache,
         notify: Notify,
     ) -> Result<Self> {
+        // Retired engines can outlive their replacement while reports drain.
+        // Their late playback states must not overwrite the replacement's UI.
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = notify_until_shutdown(notify, Arc::clone(&shutting_down));
         let device_id = config.device_id();
         let session_config = SessionConfig {
             device_id: device_id.clone(),
@@ -409,13 +425,12 @@ impl Engine {
             notify(EngineEvent::State(current.clone()));
         }
 
-        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
         let ended_flag = Arc::clone(&shutting_down);
         let ended_notify = Arc::clone(&notify);
         let ended_state = Arc::clone(&state);
         let ended_interrupted = Arc::clone(&interrupted);
-        tokio::spawn(async move {
+        let spirc_task = tokio::spawn(async move {
             spirc_task.await;
             {
                 let mut current = ended_state.lock().unwrap_or_else(|p| p.into_inner());
@@ -436,6 +451,7 @@ impl Engine {
         Ok(Self {
             player,
             spirc: Arc::new(spirc),
+            spirc_task: tokio::sync::Mutex::new(Some(spirc_task)),
             session,
             mixer,
             device_id,
@@ -552,11 +568,37 @@ impl Engine {
         &self.session
     }
 
-    pub fn shutdown(&self) {
-        self.shutting_down
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.spirc.shutdown();
-        self.player.stop();
+    pub(crate) fn begin_shutdown(&self) {
+        if !self
+            .shutting_down
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.spirc.shutdown();
+        }
+    }
+
+    pub async fn shutdown_and_wait(&self) {
+        self.begin_shutdown();
+        // Native sinks and loaders may remain blocked even after a successful
+        // report drain. Finalization never joins those threads on the runtime.
+        let _finalize_player = StopOnDrop(Some(|| {
+            self.player.finalize_shutdown();
+            self.session.shutdown();
+        }));
+        stop_connect_and_flush(
+            self.spirc_task.lock().await.take(),
+            || self.begin_shutdown(),
+            self.player.stop_and_flush(),
+            || self.player.stop(),
+        )
+        .await;
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(anyhow!("playback engine is shutting down"));
+        }
+        Ok(())
     }
 
     pub fn resume_point(&self) -> Option<PlaybackResume> {
@@ -574,6 +616,7 @@ impl Engine {
     }
 
     pub fn resume(&self, resume: PlaybackResume) -> Result<()> {
+        self.ensure_running()?;
         match resume {
             PlaybackResume::Session(snapshot) => {
                 self.spirc.restore_playback(snapshot).map_err(Into::into)
@@ -583,6 +626,7 @@ impl Engine {
     }
 
     pub fn command(&self, command: PlayerCommand) -> Result<()> {
+        self.ensure_running()?;
         let interrupts_audio = command_interrupts_audio(
             &self.state.lock().unwrap_or_else(|p| p.into_inner()),
             &command,
@@ -652,6 +696,68 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        if let Some(task) = self.spirc_task.get_mut().take() {
+            task.abort();
+        }
+        self.player.finalize_shutdown();
+        self.session.shutdown();
+    }
+}
+
+struct StopOnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for StopOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(stop) = self.0.take() {
+            stop();
+        }
+    }
+}
+
+/// Stop the Connect producer before flushing, using one budget for both.
+async fn stop_connect_and_flush<E: std::fmt::Display>(
+    connect_task: Option<tokio::task::JoinHandle<()>>,
+    stop_connect: impl FnOnce(),
+    flush: impl std::future::Future<Output = std::result::Result<(), E>>,
+    stop_player: impl FnOnce(),
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Cancelling a shutdown must stop its producer rather than detach it.
+    let mut connect_task = connect_task.map(AbortOnDrop);
+    stop_connect();
+    if let Some(task) = &mut connect_task {
+        match tokio::time::timeout_at(deadline, &mut task.0).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!("Spotify Connect shutdown failed: {error}"),
+            Err(_) => {
+                task.0.abort();
+                stop_player();
+                log::warn!("Spotify Connect shutdown timed out");
+                return;
+            }
+        }
+    }
+    match tokio::time::timeout_at(deadline, flush).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("unable to flush Spotify listening history: {error}"),
+        Err(_) => {
+            stop_player();
+            log::warn!("Spotify listening history flush timed out");
+        }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1087,6 +1193,161 @@ fn decode_folder_name(encoded: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_retired_engine_cannot_publish_late_state_or_reconnect_events() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&events);
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = notify_until_shutdown(
+            Arc::new(move |event| received.lock().unwrap().push(event)),
+            Arc::clone(&shutting_down),
+        );
+        notify(EngineEvent::State(LocalState::default()));
+        assert_eq!(events.lock().unwrap().len(), 1);
+        events.lock().unwrap().clear();
+        shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let retained_notify = Arc::clone(&notify);
+        retained_notify(EngineEvent::State(LocalState::default()));
+        retained_notify(EngineEvent::SessionEnded);
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_retirement_runs_finalization_while_other_owners_remain() {
+        let finalized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained = Arc::clone(&finalized);
+        let retirement = tokio::spawn(async move {
+            let _finalize = StopOnDrop(Some(|| {
+                finalized.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        retirement.abort();
+        let _ = retirement.await;
+        assert!(retained.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn retirement_finalizes_only_after_a_successful_report_drain() {
+        let stages = Mutex::new(Vec::new());
+        {
+            let _finalize = StopOnDrop(Some(|| stages.lock().unwrap().push("finalized")));
+            stop_connect_and_flush(
+                None,
+                || {},
+                async {
+                    stages.lock().unwrap().push("drained");
+                    Ok::<(), anyhow::Error>(())
+                },
+                || panic!("successful drain does not time out"),
+            )
+            .await;
+            assert_eq!(*stages.lock().unwrap(), ["drained"]);
+        }
+        assert_eq!(*stages.lock().unwrap(), ["drained", "finalized"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_shutdown_waits_for_connect_before_the_final_report() {
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let ending = Arc::clone(&stages);
+        let task = tokio::spawn(async move {
+            stopped.await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            ending.lock().unwrap().push("connect ended");
+        });
+        let start = tokio::time::Instant::now();
+        stop_connect_and_flush(
+            Some(task),
+            || {
+                stages.lock().unwrap().push("stop connect");
+                stop.send(()).unwrap();
+            },
+            async {
+                assert_eq!(*stages.lock().unwrap(), ["stop connect", "connect ended"]);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                stages.lock().unwrap().push("report drained");
+                Ok::<(), anyhow::Error>(())
+            },
+            || panic!("a successful flush needs no fallback stop"),
+        )
+        .await;
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        assert_eq!(
+            *stages.lock().unwrap(),
+            ["stop connect", "connect ended", "report drained"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_connect_uses_the_shutdown_budget_without_starting_a_drain() {
+        let task = tokio::spawn(std::future::pending());
+        let aborted = task.abort_handle();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let flushed = std::sync::atomic::AtomicBool::new(false);
+        let start = tokio::time::Instant::now();
+        stop_connect_and_flush(
+            Some(task),
+            || {},
+            async {
+                flushed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<(), anyhow::Error>(())
+            },
+            || stopped.store(true, std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(aborted.is_finished());
+        assert!(!flushed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_report_drain_is_bounded() {
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let start = tokio::time::Instant::now();
+        stop_connect_and_flush(
+            None,
+            || {},
+            std::future::pending::<Result<(), anyhow::Error>>(),
+            || stopped.store(true, std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn cancelling_shutdown_aborts_its_connect_producer() {
+        let connect = tokio::spawn(std::future::pending());
+        let aborted = connect.abort_handle();
+        let shutdown = tokio::spawn(stop_connect_and_flush(
+            Some(connect),
+            || {},
+            std::future::ready(Ok::<(), anyhow::Error>(())),
+            || {},
+        ));
+        tokio::task::yield_now().await;
+        shutdown.abort();
+        let _ = shutdown.await;
+        tokio::task::yield_now().await;
+        assert!(aborted.is_finished());
+    }
+
+    #[tokio::test]
+    async fn a_failed_report_does_not_crash_shutdown() {
+        stop_connect_and_flush(
+            None,
+            || {},
+            std::future::ready(Err(anyhow!("reporting endpoint unavailable"))),
+            || panic!("only a timeout needs the fallback stop"),
+        )
+        .await;
+    }
+
     #[test]
     fn loading_another_song_keeps_repeat_with_or_without_shuffle() {
         for shuffle in [None, Some(false), Some(true)] {

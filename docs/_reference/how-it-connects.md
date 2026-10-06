@@ -383,3 +383,25 @@ On startup, network work waits for the protected proxy password to be restored.
 That lookup runs on the credential worker and does not block the interface or
 shutdown. The password belongs to its host, port, and username; editing any of
 these fields clears it. See [password storage and migration](/settings-and-files/).
+
+## Listening history
+
+The playback session reports completed and interrupted listens through librespot.
+With Spotifast's own output, reports count audio frames rendered by the
+output, after resampling. A completed song's buffered tail is included; audio
+discarded by a seek or track replacement is excluded. Paused time and position
+jumps never add listening time. The default PulseAudio backend on Linux uses
+the server's playback latency to count confirmed frames and settle buffered
+tails. Other optional librespot backends count audio successfully delivered to
+their sink, because they provide no rendering callback.
+
+Closing Spotifast stops connection attempts and Connect commands before draining
+the active and any previously replaced engines. They share a ten-second budget,
+with a brief bounded cancellation cleanup. Replaced engines stop sending
+playback updates before draining, so a late stopped state cannot overwrite the
+new engine's playback. Network failures and timeouts are
+logged; reports are not persisted for a later launch. Finalization cancels
+loaders and report transport without waiting on a stalled native audio call.
+This does not require the
+optional personal Web API app, which is used to read recent history. The local
+`history.json` remains separate and is never uploaded.

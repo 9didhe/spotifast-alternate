@@ -75,6 +75,9 @@ clients. Spotifast uses its session for:
 
 librespot provides:
 
+- **Listening history:** reports completed and interrupted local playback to
+  Spotify, counting audio time rather than elapsed wall-clock time.
+
 - Spotify catalogue playback at up to 320 kbps.
 - Gapless playback, normalisation, and a local audio cache.
 - Spotify Connect, so another Spotify client can transfer playback to this

@@ -38,6 +38,8 @@ const PREMIUM_NEEDED: &str = "Local playback needs Spotify Premium.";
 const ALBUM_TYPE_TIMEOUT: Duration = Duration::from_secs(30);
 // Leave time for access-point retries plus resolver and authentication work.
 const ENGINE_CONNECT_TIMEOUT: Duration = Duration::from_secs(75);
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const ENGINE_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 // Keep at most one full Web API album page outstanding for a playback engine.
 const MAX_PENDING_ALBUM_TYPES: usize = 50;
 // Saved shows asked about in one extended-metadata request.
@@ -54,6 +56,25 @@ async fn connect_engine_with_deadline<F: std::future::Future>(
     connect: F,
 ) -> Result<F::Output, tokio::time::error::Elapsed> {
     tokio::time::timeout(ENGINE_CONNECT_TIMEOUT, connect).await
+}
+
+async fn drain_engine_shutdowns(
+    shutdowns: &mut tokio::task::JoinSet<()>,
+    deadline: tokio::time::Instant,
+) {
+    let drain = async {
+        while let Some(result) = shutdowns.join_next().await {
+            if let Err(error) = result {
+                log::warn!("player shutdown failed: {error}");
+            }
+        }
+    };
+    if tokio::time::timeout_at(deadline, drain).await.is_err() {
+        log::warn!("player shutdown timed out");
+        // Joining aborted tasks releases each engine's owned resources before
+        // the runtime ends, without giving a stalled report another deadline.
+        let _ = tokio::time::timeout(ENGINE_CANCEL_TIMEOUT, shutdowns.shutdown()).await;
+    }
 }
 
 /// True when the session has already dropped this many times in the window,
@@ -1344,6 +1365,8 @@ struct Worker {
     /// other request reports.
     rootlist_pending: bool,
     album_type_lookup: AlbumTypeLookup,
+    engine_connections: tokio::task::JoinSet<()>,
+    engine_shutdowns: tokio::task::JoinSet<()>,
     /// Saved shows waiting for the streaming session to say which are audiobooks.
     audiobook_lookup: BTreeSet<String>,
     /// Radios asked for before the streaming session was ready, by seed.
@@ -1411,6 +1434,8 @@ impl Worker {
             heard: None,
             rootlist_pending: false,
             album_type_lookup: AlbumTypeLookup::default(),
+            engine_connections: tokio::task::JoinSet::new(),
+            engine_shutdowns: tokio::task::JoinSet::new(),
             audiobook_lookup: BTreeSet::new(),
             radio_waiting: BTreeMap::new(),
             engine_busy: false,
@@ -1566,7 +1591,7 @@ impl Worker {
 
     async fn run(&mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let (cache_writes, cache_write_receiver) = mpsc::channel(1);
-        let cache_writer = tokio::spawn(store_playlist_caches(
+        let mut cache_writer = tokio::spawn(store_playlist_caches(
             cache_write_receiver,
             self.events.clone(),
             self.waker.clone(),
@@ -1811,7 +1836,7 @@ impl Worker {
                     if lease.current() && self.signed_in {
                         self.on_engine_connected(session_generation, *engine, error)
                     } else if let Some(engine) = *engine {
-                        engine.shutdown();
+                        self.retire_engine(engine);
                     }
                 }
                 Command::SignInEnded { source, attempt } => {
@@ -2022,11 +2047,57 @@ impl Worker {
                 }
             }
         }
+        let deadline = tokio::time::Instant::now() + ENGINE_SHUTDOWN_TIMEOUT;
+        // No connection may create a command producer after the final drain.
+        // Keep the receiver open until cancellation finishes so any connection
+        // already completing can hand its engine to the retirement drain.
+        if tokio::time::timeout_at(deadline, self.engine_connections.shutdown())
+            .await
+            .is_err()
+        {
+            log::warn!("player connection shutdown timed out");
+        }
+        commands.close();
+        self.engine_busy = false;
+        while let Ok(command) = commands.try_recv() {
+            self.retire_queued_engine(command);
+        }
+        for command in std::mem::take(&mut self.waiting_for_proxy) {
+            self.retire_queued_engine(command);
+        }
         if let Some(engine) = self.engine.take() {
-            engine.shutdown();
+            self.retire_engine(engine);
         }
         drop(cache_writes);
-        let _ = cache_writer.await;
+        if tokio::time::timeout_at(deadline, &mut cache_writer)
+            .await
+            .is_err()
+        {
+            cache_writer.abort();
+            log::warn!("playlist cache shutdown timed out");
+        }
+        drain_engine_shutdowns(&mut self.engine_shutdowns, deadline).await;
+    }
+
+    fn retire_queued_engine(&mut self, command: Command) {
+        if let Command::EngineConnected { engine, .. } = command
+            && let Some(engine) = *engine
+        {
+            self.retire_engine(engine);
+        }
+    }
+
+    fn retire_engine(&mut self, engine: impl Into<Arc<Engine>>) {
+        let engine = engine.into();
+        engine.begin_shutdown();
+        while let Some(result) = self.engine_shutdowns.try_join_next() {
+            if let Err(error) = result {
+                log::warn!("player shutdown failed: {error}");
+            }
+        }
+        self.engine_shutdowns.spawn(async move {
+            engine.shutdown_and_wait().await;
+        });
     }
 
     // ---- Web API sign-in --------------------------------------------------
@@ -2477,7 +2548,7 @@ impl Worker {
         self.radio_waiting.clear();
         self.carry_volume();
         if let Some(engine) = self.engine.take() {
-            engine.shutdown();
+            self.retire_engine(engine);
         }
         if let Some(cancel) = self.cancel_signin.take() {
             let _ = cancel.send(true);
@@ -2612,7 +2683,7 @@ impl Worker {
         self.carry_volume();
         if let Some(engine) = self.engine.take() {
             self.resume = engine.resume_point();
-            engine.shutdown();
+            self.retire_engine(engine);
         }
     }
 
@@ -2718,7 +2789,8 @@ impl Worker {
         let commands = self.commands.clone();
         let waker = self.waker.clone();
         let session_generation = self.album_type_lookup.session_generation;
-        tokio::spawn(async move {
+        while self.engine_connections.try_join_next().is_some() {}
+        self.engine_connections.spawn(async move {
             let cache = match config.open_cache() {
                 Ok(cache) => cache,
                 Err(error) => {
@@ -2776,14 +2848,14 @@ impl Worker {
     ) {
         if !self.signed_in || session_generation != self.album_type_lookup.session_generation {
             if let Some(engine) = engine {
-                engine.shutdown();
+                self.retire_engine(engine);
             }
             return;
         }
         self.engine_busy = false;
         if std::mem::take(&mut self.engine_restart_pending) {
             if let Some(engine) = engine {
-                engine.shutdown();
+                self.retire_engine(engine);
             }
             // Keep `resume`: it belongs to the engine which was replaced,
             // not to this stale attempt. The newest config is already stored.
@@ -2794,7 +2866,7 @@ impl Worker {
             Some(engine) => {
                 if let Some(grant) = engine.credentials() {
                     if !playback_account_matches(&grant, self.api.account()) {
-                        engine.shutdown();
+                        self.retire_engine(engine);
                         self.emit(Event::Playback(LocalPlayback::Failed("Playback was authorized for another Spotify account. Enable playback again with the signed-in account.".into())));
                         return;
                     }
@@ -2843,7 +2915,7 @@ impl Worker {
             self.album_type_lookup.clear_engine_work();
             self.carry_volume();
             if let Some(engine) = self.engine.take() {
-                engine.shutdown();
+                self.retire_engine(engine);
             }
             let credential_stored = self.playback_grant.is_some();
             if credential_stored {
@@ -5217,7 +5289,7 @@ mod authorization_tests {
                 .await
                 .unwrap();
         });
-        assert_eq!(worker.waiting_for_proxy.len(), 1);
+        assert!(worker.waiting_for_proxy.is_empty());
         assert_eq!(worker.engine_config.proxy, ProxyConfig::Off);
     }
 
@@ -5629,6 +5701,157 @@ mod authorization_tests {
             assert!(matches!(runtime.block_on(lease.load()).unwrap().grant,
                 Some(StoredGrant::Web(saved)) if saved.refresh_token == "dummy-refresh"));
         }
+    }
+
+    #[test]
+    fn quitting_waits_for_a_retired_engine_without_a_current_engine() {
+        let (runtime, mut worker, _) = worker("retired-engine-shutdown");
+        runtime.block_on(async {
+            let (release, released) = tokio::sync::oneshot::channel();
+            worker.engine_shutdowns.spawn(async move {
+                released.await.unwrap();
+            });
+            assert!(worker.engine.is_none());
+            let (commands, receiver) = mpsc::unbounded_channel();
+            commands.send(Command::Shutdown).unwrap();
+            let shutdown = worker.run(receiver);
+            tokio::pin!(shutdown);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            shutdown.await;
+        });
+    }
+
+    #[tokio::test]
+    async fn engine_shutdown_drain_waits_for_active_and_retired_cleanup() {
+        // Both the active engine at quit and earlier retired engines register
+        // their cleanup in this same set. Keep the test independent of Spotify.
+        let mut shutdowns = tokio::task::JoinSet::new();
+        let (active, active_done) = tokio::sync::oneshot::channel();
+        let (retired, retired_done) = tokio::sync::oneshot::channel();
+        shutdowns.spawn(async move { active_done.await.unwrap() });
+        shutdowns.spawn(async move { retired_done.await.unwrap() });
+        let deadline = tokio::time::Instant::now() + ENGINE_SHUTDOWN_TIMEOUT;
+        let drain = drain_engine_shutdowns(&mut shutdowns, deadline);
+        tokio::pin!(drain);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut drain)
+                .await
+                .is_err()
+        );
+        retired.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut drain)
+                .await
+                .is_err()
+        );
+        active.send(()).unwrap();
+        drain.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn engine_shutdown_drain_aborts_stalled_tasks_at_one_deadline() {
+        let mut shutdowns = tokio::task::JoinSet::new();
+        let (held, dropped) = tokio::sync::oneshot::channel::<()>();
+        shutdowns.spawn(async move {
+            let _held_until_cancelled = held;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let started = tokio::time::Instant::now();
+        drain_engine_shutdowns(&mut shutdowns, started + ENGINE_SHUTDOWN_TIMEOUT).await;
+        assert!(dropped.await.is_err(), "stalled task was cancelled");
+        assert!(shutdowns.is_empty());
+        assert!(started.elapsed() <= ENGINE_SHUTDOWN_TIMEOUT + ENGINE_CANCEL_TIMEOUT);
+    }
+
+    #[test]
+    fn shutdown_discards_queued_commands_and_proxy_waiters() {
+        let (runtime, mut worker, events) = worker("shutdown-queued-commands");
+        worker.signed_in = true;
+        worker.restoring_proxy = true;
+        let mut queued_config = worker.engine_config.clone();
+        queued_config.proxy = ProxyConfig::System;
+        worker
+            .waiting_for_proxy
+            .push_back(Command::RestartEngine(queued_config));
+        worker
+            .waiting_for_proxy
+            .push_back(Command::EngineConnected {
+                session_generation: worker.album_type_lookup.session_generation,
+                engine: Box::new(None),
+                error: Some("queued connection error".into()),
+                lease: worker.credentials.lease(CredentialSlot::Playback),
+            });
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands.send(Command::Shutdown).unwrap();
+        commands.send(Command::SignOut).unwrap();
+        commands
+            .send(Command::EngineConnected {
+                session_generation: worker.album_type_lookup.session_generation,
+                engine: Box::new(None),
+                error: Some("late connection error".into()),
+                lease: worker.credentials.lease(CredentialSlot::Playback),
+            })
+            .unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(worker.signed_in, "queued SignOut was not executed");
+        assert!(commands.is_closed());
+        assert!(worker.waiting_for_proxy.is_empty());
+        assert_eq!(worker.engine_config.proxy, ProxyConfig::Off);
+        assert!(events.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn shutdown_quiesces_connection_producers_before_report_drain() {
+        let (runtime, mut worker, _) = worker("shutdown-connection-producer");
+        runtime.block_on(async {
+            struct ConnectionHandoff {
+                commands: mpsc::UnboundedSender<Command>,
+                open: Option<tokio::sync::oneshot::Sender<bool>>,
+            }
+            impl Drop for ConnectionHandoff {
+                fn drop(&mut self) {
+                    let _ = self.open.take().unwrap().send(!self.commands.is_closed());
+                }
+            }
+            let (commands, receiver) = mpsc::unbounded_channel();
+            let (open, receiver_open_during_cleanup) = tokio::sync::oneshot::channel();
+            let handoff = ConnectionHandoff {
+                commands: commands.clone(),
+                open: Some(open),
+            };
+            let (connection, cancelled) = tokio::sync::oneshot::channel::<()>();
+            let (late_engine, late_result) = tokio::sync::oneshot::channel::<()>();
+            worker.engine_connections.spawn(async move {
+                let _handoff_until_cancelled = handoff;
+                let _connection_until_cancelled = connection;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                late_engine.send(()).unwrap();
+            });
+            worker.engine_shutdowns.spawn(async move {
+                assert!(
+                    cancelled.await.is_err(),
+                    "connection producer ended before reports finish"
+                );
+            });
+            commands.send(Command::Shutdown).unwrap();
+            worker.run(receiver).await;
+            assert!(
+                receiver_open_during_cleanup.await.unwrap(),
+                "completed connection results retain their retirement handoff"
+            );
+            assert!(worker.engine_connections.is_empty());
+            assert!(worker.engine_shutdowns.is_empty());
+            assert!(
+                late_result.await.is_err(),
+                "no engine can arrive after drain"
+            );
+        });
     }
 
     #[test]

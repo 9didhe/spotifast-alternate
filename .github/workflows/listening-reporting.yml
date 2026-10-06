@@ -1,0 +1,57 @@
+name: Listening reporting
+
+on:
+  push:
+    branches: [main, codex/update-v0.12.0-reporting]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reporting:
+    name: Listening regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            features: pulseaudio-backend,rustls-tls-native-roots
+          - os: macos-latest
+            features: rustls-tls-native-roots
+          - os: windows-latest
+            features: rustls-tls-native-roots
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the maintained dependency pin
+        id: dependency
+        shell: python
+        run: |
+          import os, tomllib
+          with open("Cargo.toml", "rb") as source:
+              dependency = tomllib.load(source)["patch"]["crates-io"]["librespot-playback"]
+          repository = dependency["git"].removeprefix("https://github.com/").removesuffix(".git")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"repository={repository}\nrevision={dependency['rev']}\n")
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ steps.dependency.outputs.repository }}
+          ref: ${{ steps.dependency.outputs.revision }}
+          path: .cache/listening-dependency
+      - uses: dtolnay/rust-toolchain@stable
+      - name: PulseAudio development library
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpulse-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .cache/listening-dependency
+      # Cargo test in Spotifast does not run a dependency's private tests.
+      # This checkout has its own target directory and uses the exact app pin.
+      - name: Core and Connect regressions
+        working-directory: .cache/listening-dependency
+        run: cargo test --locked -p librespot-core -p librespot-connect --no-default-features --features rustls-tls-native-roots --lib
+      - name: Listening, output timing, and finalization regressions
+        working-directory: .cache/listening-dependency
+        run: cargo test --locked -p librespot-playback --no-default-features --features ${{ matrix.features }} --lib
